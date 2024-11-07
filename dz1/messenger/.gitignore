@@ -1,0 +1,12 @@
+release.mk
+debug.mk
+analyze.mk
+talk
+messenger
+log.log
+log
+compile_commands.json
+makefile
+__pycache__
+.cache
+src/build
