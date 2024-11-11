@@ -3,4 +3,4 @@
 3) Signals + 
 4) FIFO_PIPE + 
 5) Threads +
-6) Semaphore
+6) Semaphore + (кроме 5 - пингпонг)
