@@ -4,4 +4,4 @@
 4) FIFO_PIPE + 
 5) Threads +
 6) Semaphore + (кроме 5 - пингпонг)
-7) scripts
+7) scripts +
