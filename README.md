@@ -5,3 +5,4 @@
 5) Threads +
 6) Semaphore + (кроме 5 - пингпонг)
 7) scripts +
+8) Queue +
