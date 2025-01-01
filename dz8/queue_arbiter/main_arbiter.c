@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <assert.h>
 #include <stdbool.h>
+#include <string.h>
 
 #include <time.h>
 #include <unistd.h>
@@ -24,13 +25,20 @@
 typedef struct Arbiter {
     ClientTable client_table;
     int queue_id;
-    // int shmem_id;
+    int shmem_id;
     AResponse* response;
 } Arbiter;
 
-void FreeIPC(int queue_id, int shmem_id, void* shmem_ptr);
-void* DisconectService(void* arg);
-void ListenOnMessages(Arbiter* arbiter);
+typedef enum ArbiterError {
+    ArbiterError_kOk = 0,
+    ArbiterError_kCantInit = 1,
+} ArbiterError;
+
+ArbiterError ArbiterInit(Arbiter* arbiter);
+void FreeArbiter(Arbiter* arbiter);
+
+void* DisconectService(void* disconnect_arg);
+void* ListenOnMessages(void* listen_arg);
 
 void RegisterClient(Arbiter* arbiter, AMessage* mes);
 void SendDestId(Arbiter* arbiter, AMessage* mes);
@@ -39,37 +47,59 @@ int main(const int argc, const char* argv[argc + 1]) {
     LoggingStatus log_status = LoggingSetup("log_arbiter.log");
     assert(log_status == kLoggingStatus_Ok);
 
-    int queue_id = msgget(ftok(kQueueFile, 0), kFullAccess | IPC_CREAT);
+    Arbiter arbiter = {0};
+    ArbiterInit(&arbiter);
+
+    pthread_t messages_service_thread = {0};
+    pthread_t disconect_service_thread = {0};    
+    
+    pthread_create(&messages_service_thread, NULL, ListenOnMessages, &arbiter);
+    pthread_create(&disconect_service_thread, NULL, DisconectService, &arbiter);
+
+    // pthread_cancel(disconect_service_thread);
+    //
+    pthread_join(messages_service_thread, NULL);
+    pthread_join(disconect_service_thread, NULL);
+
+    FreeArbiter(&arbiter);
+
+    return 0;
+}
+
+ArbiterError ArbiterInit(Arbiter* arbiter) {
+    assert(arbiter != NULL);
+
+    memset(arbiter, 0, sizeof(Arbiter));
+
+    int queue_id = msgget(ftok(kQueueFile, 0), kFullAccess | IPC_CREAT/* | IPC_EXCL*/);
     if (queue_id < 0) {
         perror(ARBITER_PROMPT "cant get queue id");
         Log("cant get queue\n");
-        FreeIPC(queue_id, -1, (void*)-1);
 
-        return EXIT_FAILURE;
+        return ArbiterError_kCantInit;
     }
     LogVariable("%d", queue_id);
+    arbiter->queue_id = queue_id;
 
-    int shmem_id = shmget(ftok(kShmemFile, 0), sizeof(AResponse), kFullAccess | IPC_CREAT);
+    int shmem_id = shmget(ftok(kShmemFile, 0), sizeof(AResponse), kFullAccess | IPC_CREAT/* | IPC_EXCL*/);
     if (shmem_id < 0) {
         perror(ARBITER_PROMPT "cant get shmem id");
         Log("cant get shmem\n");
-        FreeIPC(queue_id, shmem_id, (void*)-1);
 
         return EXIT_FAILURE;
     }
     LogVariable("%d", shmem_id);
+    arbiter->shmem_id = shmem_id;
 
     void* shmem_ptr = shmat(shmem_id, NULL, 0);
     if (shmem_ptr == (void*)-1) {
         perror(ARBITER_PROMPT "cant attach shmem");
         Log("cant attach shmem\n");
-        FreeIPC(queue_id, shmem_id, shmem_ptr);
 
         return EXIT_FAILURE;
     }
     LogVariable("%p", shmem_ptr);
-
-    AResponse* response = (AResponse*)shmem_ptr;
+    AResponse* response = shmem_ptr;
 
     Log("init response");
     // init responese
@@ -78,55 +108,42 @@ int main(const int argc, const char* argv[argc + 1]) {
     pthread_mutexattr_t mutex_attr = {0};
     pthread_mutexattr_init(&mutex_attr);
     pthread_mutexattr_setpshared(&mutex_attr, PTHREAD_PROCESS_SHARED);
-
     pthread_mutex_init(&response->resp_mutex, &mutex_attr); // NOTE might be not NULL
     
     pthread_condattr_t cond_attr = {0}; 
     pthread_condattr_init(&cond_attr);
     pthread_condattr_setpshared(&cond_attr, PTHREAD_PROCESS_SHARED);
-
     pthread_cond_init(&response->resp_cond, &cond_attr);
+    
     response->resp_content.resp_id_for_arbiter = 0;
     response->resp_content.resp_id_for_rmessages = 0;
     response->resp_content.resp_pid = 0;
     response->client_resp = false;
 
-    Arbiter arbiter = {
-        .client_table = {0},
-        .queue_id = queue_id,
-        .response = response,
-    };
+    arbiter->response = response;
 
-    InitTable(&arbiter.client_table);
+    InitTable(&arbiter->client_table);
     Log("response inited\n");
 
-    // pthread_t disconect_service_thread = {0};    
-    // pthread_create(&disconect_service_thread, NULL, DisconectService, &arbiter);
-    
-    ListenOnMessages(&arbiter);
-
-    // pthread_cancel(disconect_service_thread);
-    // pthread_join(disconect_service_thread, NULL);
-
-    FreeIPC(queue_id, shmem_id, shmem_ptr);
-
-    return 0;
+    return ArbiterError_kOk;
 }
 
-void FreeIPC(int queue_id, int shmem_id, void* shmem_ptr) {
-    LogFunctionEntry();
+void FreeArbiter(Arbiter* arbiter) {
+    assert(arbiter != NULL);
 
-    if (shmem_ptr != (void*)-1) {
-        shmdt(shmem_ptr);
+    int cond_destr_res = pthread_cond_destroy(&arbiter->response->resp_cond);
+    if (cond_destr_res != 0) {
+        fprintf(stderr, "some threads are busy on condvar\n");
     }
 
-    if (shmem_id != -1) {
-        shmctl(shmem_id, IPC_RMID, NULL);
+    int mutex_destr_res = pthread_mutex_destroy(&arbiter->response->resp_mutex);
+    if (mutex_destr_res != 0) {
+        fprintf(stderr, "mutex where locked when destroyed\n");
     }
 
-    if (queue_id != -1) {
-        msgctl(queue_id, IPC_RMID, NULL);
-    }
+    msgctl(arbiter->queue_id, IPC_RMID, NULL);
+    shmdt(arbiter->response);
+    shmctl(arbiter->shmem_id, IPC_RMID, NULL);
 }
 
 void* DisconectService(void* arg) {
@@ -141,8 +158,10 @@ void* DisconectService(void* arg) {
     return NULL;
 }
 
-void ListenOnMessages(Arbiter* arbiter) {
-    assert(arbiter != NULL);
+void* ListenOnMessages(void* listen_arg) {
+    assert(listen_arg != NULL);
+
+    Arbiter* arbiter = listen_arg;
 
     LogFunctionEntry();
 
@@ -150,8 +169,6 @@ void ListenOnMessages(Arbiter* arbiter) {
 
     ssize_t rcv_res = 0;
     while ((rcv_res = msgrcv(arbiter->queue_id, &mes, sizeof(mes) - sizeof(mes.type), kArbiterId, 0)) >= 0) {
-        // LogVariable("%ld", rcv_res);
-
         switch (mes.policy) {
             case MessageArbiterPolicy_kRegisterClient:
                 RegisterClient(arbiter, &mes);
